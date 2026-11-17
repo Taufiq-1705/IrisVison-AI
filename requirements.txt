@@ -1,0 +1,18 @@
+# Iris Vision Dependencies (Windows 11 Native - Python 3.12 + CUDA 12.4)
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+torch
+torchvision
+opencv-python
+scikit-learn
+pandas
+matplotlib
+seaborn
+fastapi
+uvicorn
+python-multipart
+httpx
+pydantic
+tqdm
+pillow
+

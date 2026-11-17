@@ -1,0 +1,52 @@
+# ==============================================================================
+# Python & Virtual Environments
+# ==============================================================================
+.venv/
+venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ==============================================================================
+# Datasets (Local Only — Too Large for Git)
+# ==============================================================================
+Retinal Fundus Images/
+dataset2_balanced/
+dataset2_balanced(old dataset, don't use)/
+
+# ==============================================================================
+# Model Checkpoints & Binary Weights (Keep model_config.json Tracked)
+# ==============================================================================
+*.pth
+*.pt
+*.onnx
+*.safetensors
+*.h5
+
+# ==============================================================================
+# Generated Large Outputs & Historical Training Archives
+# (Keep outputs/model_comparison_report.md and outputs/training_history.json)
+# ==============================================================================
+outputs/*.csv
+outputs/*.png
+outputs/baseline_old_dataset/
+outputs/mobilenetv2_new_dataset/
+outputs/resnet50_new_dataset/
+
+# ==============================================================================
+# Environment, IDE, & OS Artifacts
+# ==============================================================================
+.env
+.env.*
+.vscode/
+.idea/
+*.log
+Thumbs.db
+Desktop.ini
+.DS_Store
