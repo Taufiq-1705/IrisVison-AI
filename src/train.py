@@ -33,22 +33,30 @@ from src.config import (
     CLAHE_CLIP_LIMIT,
     CLAHE_TILE_GRID_SIZE,
     CLASS_TO_IDX,
+    CLASS_TO_IDX_5,
     CLASSES,
+    CLASSES_5,
     DATASET_DIR,
     EARLY_STOPPING_PATIENCE,
     FINETUNE_EPOCHS,
     HEAD_LR,
     IDX_TO_CLASS,
+    IDX_TO_CLASS_5,
     IMAGE_SIZE,
     IMAGENET_MEAN,
     IMAGENET_STD,
     LABEL_SMOOTHING,
+    MODEL_5CLASS_PATH,
     MODEL_BEST_PATH,
     MODEL_CONFIG_JSON,
+    MODELS_DIR,
     NUM_CLASSES,
+    NUM_CLASSES_5,
     NUM_WORKERS,
+    OUTPUTS_DIR,
     PIN_MEMORY,
     SEED,
+    TRAINING_HISTORY_5CLASS_JSON,
     TRAINING_HISTORY_JSON,
     USE_AMP,
     WARMUP_EPOCHS,
@@ -61,6 +69,7 @@ from src.config import (
 from src.dataset import (
     EyeDiseaseDataset,
     compute_class_weights,
+    get_5class_split_dataframes,
     get_default_transforms,
     get_split_dataframes,
 )
@@ -162,24 +171,30 @@ def save_best_artifacts(
     warmup_epochs: int,
     finetune_epochs: int,
     class_weights: torch.Tensor,
+    active_classes: list[str] = CLASSES,
+    checkpoint_path: Path = MODEL_BEST_PATH,
+    config_path: Path = MODEL_CONFIG_JSON,
 ) -> None:
     """Save best model weights (.pth) and config metadata (.json)."""
     ensure_model_dir()
+    num_cls = len(active_classes)
+    cls_to_idx = {c: i for i, c in enumerate(active_classes)}
+    idx_to_cls = {i: c for i, c in enumerate(active_classes)}
 
     checkpoint = {
         "epoch": best_epoch,
         "phase": best_phase,
         "backbone_name": backbone_name,
-        "num_classes": NUM_CLASSES,
-        "classes": CLASSES,
-        "class_to_idx": CLASS_TO_IDX,
-        "idx_to_class": IDX_TO_CLASS,
+        "num_classes": num_cls,
+        "classes": active_classes,
+        "class_to_idx": cls_to_idx,
+        "idx_to_class": idx_to_cls,
         "model_state_dict": model.state_dict(),
         "best_val_f1": best_val_f1,
         "best_val_acc": best_val_acc,
         "best_val_loss": best_val_loss,
     }
-    torch.save(checkpoint, MODEL_BEST_PATH)
+    torch.save(checkpoint, checkpoint_path)
 
     weights_init = (
         "IMAGENET1K_V2" if backbone_name in ("mobilenet_v2", "resnet50") else "IMAGENET1K_V1"
@@ -188,10 +203,10 @@ def save_best_artifacts(
         "project": "Iris Vision",
         "backbone": backbone_name,
         "weights_init": weights_init,
-        "num_classes": NUM_CLASSES,
-        "classes": CLASSES,
-        "class_to_idx": CLASS_TO_IDX,
-        "idx_to_class": {str(k): v for k, v in IDX_TO_CLASS.items()},
+        "num_classes": num_cls,
+        "classes": active_classes,
+        "class_to_idx": cls_to_idx,
+        "idx_to_class": {str(k): v for k, v in idx_to_cls.items()},
         "image_size": list(IMAGE_SIZE),
         "preprocessing": {
             "safe_crop_fundus_roi": True,
@@ -214,41 +229,79 @@ def save_best_artifacts(
             "clean_conflicting_duplicates": True,
         },
     }
-    with open(MODEL_CONFIG_JSON, "w", encoding="utf-8") as f:
+    with open(config_path, "w", encoding="utf-8") as f:
         json.dump(config_payload, f, indent=2)
 
 
 def run_training(
-    backbone_name: str = BACKBONE_NAME,
+    backbone_name: str = "resnet50",
+    num_classes: int = NUM_CLASSES_5,
     warmup_epochs: int = WARMUP_EPOCHS,
     finetune_epochs: int = FINETUNE_EPOCHS,
     batch_size: int = BATCH_SIZE,
     num_workers: int = NUM_WORKERS,
     patience: int = EARLY_STOPPING_PATIENCE,
     seed: int = SEED,
+    checkpoint_out_override: Path | None = None,
+    config_out_override: Path | None = None,
 ) -> Dict:
     """Execute full 2-phase GPU training and save best model & training history."""
     seed_everything(seed)
     ensure_output_dir()
     ensure_model_dir()
 
+    active_classes = CLASSES_5 if num_classes == 5 else CLASSES
+    checkpoint_out = (
+        checkpoint_out_override
+        if checkpoint_out_override is not None
+        else (MODEL_5CLASS_PATH if num_classes == 5 else MODEL_BEST_PATH)
+    )
+    config_out = config_out_override if config_out_override is not None else MODEL_CONFIG_JSON
+    checkpoint_out.parent.mkdir(parents=True, exist_ok=True)
+    config_out.parent.mkdir(parents=True, exist_ok=True)
+
+    # Also archive 5-class artifacts in a dedicated per-backbone subfolder so
+    # MobileNetV2 and ResNet-50 5-class models never overwrite each other.
+    archive_ckpt: Path | None = None
+    archive_cfg: Path | None = None
+    archive_hist: Path | None = None
+    if num_classes == 5:
+        bb_tag = backbone_name.replace("_", "")
+        archive_model_dir = MODELS_DIR / f"{bb_tag}_5class"
+        archive_output_dir = OUTPUTS_DIR / f"{bb_tag}_5class"
+        archive_model_dir.mkdir(parents=True, exist_ok=True)
+        archive_output_dir.mkdir(parents=True, exist_ok=True)
+        archive_ckpt = archive_model_dir / f"ai_sentinel_{bb_tag}_5class.pth"
+        archive_cfg = archive_model_dir / "model_config.json"
+        archive_hist = archive_output_dir / "training_history_5class.json"
+
+    history_out = TRAINING_HISTORY_5CLASS_JSON if num_classes == 5 else TRAINING_HISTORY_JSON
+
     device = get_device()
     use_amp = (device.type == "cuda") and USE_AMP
     print("=" * 72)
-    print(f"IRIS VISION - TWO-PHASE TRAINING ({backbone_name.upper()})")
+    print(f"IRIS VISION - TWO-PHASE TRAINING ({backbone_name.upper()} | {num_classes}-CLASS)")
+    print(f"Classes: {active_classes}")
     print(f"Device: {device} | AMP Enabled: {use_amp} | Batch Size: {batch_size}")
     if device.type == "cuda":
         print(f"GPU: {torch.cuda.get_device_name(0)}")
     print("=" * 72)
 
-    # 1. Load cleaned splits (conflicting MD5 duplicates pruned)
-    train_df, val_df, test_df = get_split_dataframes(
-        dataset_dir=DATASET_DIR,
-        use_existing_splits=True,
-        clean_conflicting_duplicates=True,
-        balance_train=False,
-        seed=seed,
-    )
+    # 1. Load cleaned splits (5-class with non_fundus or 4-class ocular)
+    if num_classes == 5:
+        train_df, val_df, test_df = get_5class_split_dataframes(
+            dataset_dir=DATASET_DIR,
+            balance_train=True,
+            seed=seed,
+        )
+    else:
+        train_df, val_df, test_df = get_split_dataframes(
+            dataset_dir=DATASET_DIR,
+            use_existing_splits=True,
+            clean_conflicting_duplicates=True,
+            balance_train=False,
+            seed=seed,
+        )
     print(f"Train samples: {len(train_df)} | Class counts: {train_df['class_name'].value_counts().to_dict()}")
     print(f"Val samples  : {len(val_df)} | Class counts: {val_df['class_name'].value_counts().to_dict()}")
     print(f"Test samples : {len(test_df)} | Class counts: {test_df['class_name'].value_counts().to_dict()}")
@@ -288,12 +341,12 @@ def run_training(
     )
 
     # 2. Weighted CrossEntropyLoss with Label Smoothing
-    class_weights = compute_class_weights(train_df).to(device)
+    class_weights = compute_class_weights(train_df, num_classes=num_classes).to(device)
     print(f"Class Weights: {[round(w, 4) for w in class_weights.cpu().tolist()]}")
     criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=LABEL_SMOOTHING)
 
     # 3. Build Model & AMP Scaler
-    model = build_model(backbone_name=backbone_name, num_classes=NUM_CLASSES, pretrained=True).to(device)
+    model = build_model(backbone_name=backbone_name, num_classes=num_classes, pretrained=True).to(device)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     history: list[dict] = []
@@ -342,7 +395,26 @@ def run_training(
                 warmup_epochs,
                 finetune_epochs,
                 class_weights,
+                active_classes=active_classes,
+                checkpoint_path=checkpoint_out,
+                config_path=config_out,
             )
+            if archive_ckpt is not None and archive_cfg is not None and archive_ckpt != checkpoint_out:
+                save_best_artifacts(
+                    model,
+                    backbone_name,
+                    best_epoch,
+                    best_phase,
+                    best_val_f1,
+                    best_val_acc,
+                    best_val_loss,
+                    warmup_epochs,
+                    finetune_epochs,
+                    class_weights,
+                    active_classes=active_classes,
+                    checkpoint_path=archive_ckpt,
+                    config_path=archive_cfg,
+                )
 
         mark = " *" if improved else ""
         print(
@@ -420,7 +492,26 @@ def run_training(
                 warmup_epochs,
                 finetune_epochs,
                 class_weights,
+                active_classes=active_classes,
+                checkpoint_path=checkpoint_out,
+                config_path=config_out,
             )
+            if archive_ckpt is not None and archive_cfg is not None and archive_ckpt != checkpoint_out:
+                save_best_artifacts(
+                    model,
+                    backbone_name,
+                    best_epoch,
+                    best_phase,
+                    best_val_f1,
+                    best_val_acc,
+                    best_val_loss,
+                    warmup_epochs,
+                    finetune_epochs,
+                    class_weights,
+                    active_classes=active_classes,
+                    checkpoint_path=archive_ckpt,
+                    config_path=archive_cfg,
+                )
         else:
             no_improve_count += 1
 
@@ -455,24 +546,31 @@ def run_training(
             break
 
     # Save training history
-    with open(TRAINING_HISTORY_JSON, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "backbone": backbone_name,
-                "best_epoch": best_epoch,
-                "best_val_f1": round(best_val_f1, 5),
-                "best_val_acc": round(best_val_acc, 5),
-                "warmup_epochs": warmup_epochs,
-                "history": history,
-            },
-            f,
-            indent=2,
-        )
+    history_payload = {
+        "backbone": backbone_name,
+        "num_classes": num_classes,
+        "classes": active_classes,
+        "best_epoch": best_epoch,
+        "best_val_f1": round(best_val_f1, 5),
+        "best_val_acc": round(best_val_acc, 5),
+        "warmup_epochs": warmup_epochs,
+        "history": history,
+    }
+    with open(history_out, "w", encoding="utf-8") as f:
+        json.dump(history_payload, f, indent=2)
+    if history_out != TRAINING_HISTORY_JSON:
+        with open(TRAINING_HISTORY_JSON, "w", encoding="utf-8") as f:
+            json.dump(history_payload, f, indent=2)
+    if archive_hist is not None:
+        with open(archive_hist, "w", encoding="utf-8") as f:
+            json.dump(history_payload, f, indent=2)
 
     print("\n" + "=" * 72)
-    print(f"[DONE] Best Model Saved  : {MODEL_BEST_PATH}")
-    print(f"[DONE] Model Config Saved: {MODEL_CONFIG_JSON}")
-    print(f"[DONE] History Saved     : {TRAINING_HISTORY_JSON}")
+    print(f"[DONE] Best Model Saved  : {checkpoint_out}")
+    print(f"[DONE] Model Config Saved: {config_out}")
+    if archive_ckpt is not None:
+        print(f"[DONE] Archived 5-Class  : {archive_ckpt}")
+    print(f"[DONE] History Saved     : {history_out}")
     print(
         f"Best Epoch: {best_epoch} ({best_phase}) | "
         f"Best Val Acc: {best_val_acc:.4f} | Best Val F1: {best_val_f1:.4f}"
@@ -492,15 +590,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--backbone",
         type=str,
-        default=BACKBONE_NAME,
-        choices=["mobilenet_v2", "efficientnet_b0", "resnet50"],
-        help="Backbone architecture (default: mobilenet_v2)",
+        default="resnet50",
+        choices=["mobilenet_v2", "mobilenet_v3_small", "efficientnet_b0", "resnet50"],
+        help="Backbone architecture (default: resnet50)",
+    )
+    parser.add_argument(
+        "--num-classes",
+        type=int,
+        default=NUM_CLASSES_5,
+        choices=[4, 5],
+        help="Number of output classes: 5 (with non_fundus) or 4 (legacy ocular-only).",
     )
     parser.add_argument("--warmup-epochs", type=int, default=WARMUP_EPOCHS)
     parser.add_argument("--finetune-epochs", type=int, default=FINETUNE_EPOCHS)
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     parser.add_argument("--num-workers", type=int, default=NUM_WORKERS)
     parser.add_argument("--patience", type=int, default=EARLY_STOPPING_PATIENCE)
+    parser.add_argument("--checkpoint-out", type=str, default=None, help="Optional custom checkpoint output path")
+    parser.add_argument("--config-out", type=str, default=None, help="Optional custom config JSON output path")
     return parser.parse_args()
 
 
@@ -508,10 +615,13 @@ if __name__ == "__main__":
     args = parse_args()
     run_training(
         backbone_name=args.backbone,
+        num_classes=args.num_classes,
         warmup_epochs=args.warmup_epochs,
         finetune_epochs=args.finetune_epochs,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         patience=args.patience,
+        checkpoint_out_override=Path(args.checkpoint_out) if args.checkpoint_out else None,
+        config_out_override=Path(args.config_out) if args.config_out else None,
     )
 

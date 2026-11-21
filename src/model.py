@@ -8,13 +8,18 @@ from typing import Iterator
 import torch
 import torch.nn as nn
 from torchvision import models
-from torchvision.models import EfficientNet_B0_Weights, MobileNet_V2_Weights, ResNet50_Weights
+from torchvision.models import (
+    EfficientNet_B0_Weights,
+    MobileNet_V2_Weights,
+    MobileNet_V3_Small_Weights,
+    ResNet50_Weights,
+)
 
 from src.config import BACKBONE_NAME, NUM_CLASSES
 
 
 class EyeDiseaseClassifier(nn.Module):
-    """4-class ocular disease classifier with transferable backbone and custom head."""
+    """Multi-class (2, 4, or 5-class) ocular classifier with transferable backbone and custom head."""
 
     def __init__(
         self,
@@ -32,6 +37,11 @@ class EyeDiseaseClassifier(nn.Module):
             base_model = models.mobilenet_v2(weights=weights)
             self.features = base_model.features
             in_features = base_model.classifier[1].in_features
+        elif self.backbone_name == "mobilenet_v3_small":
+            weights = MobileNet_V3_Small_Weights.IMAGENET1K_V1 if pretrained else None
+            base_model = models.mobilenet_v3_small(weights=weights)
+            self.features = base_model.features
+            in_features = base_model.classifier[0].in_features
         elif self.backbone_name == "efficientnet_b0":
             weights = EfficientNet_B0_Weights.IMAGENET1K_V1 if pretrained else None
             base_model = models.efficientnet_b0(weights=weights)
@@ -56,7 +66,7 @@ class EyeDiseaseClassifier(nn.Module):
         else:
             raise ValueError(
                 f"Unsupported backbone '{backbone_name}'. "
-                "Supported backbones: 'mobilenet_v2', 'efficientnet_b0', 'resnet50'."
+                "Supported backbones: 'mobilenet_v2', 'mobilenet_v3_small', 'efficientnet_b0', 'resnet50'."
             )
 
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))

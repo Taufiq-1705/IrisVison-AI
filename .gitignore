@@ -16,6 +16,7 @@ __pycache__/
 # ==============================================================================
 # Datasets (Local Only — Too Large for Git)
 # ==============================================================================
+DATASETS/
 Retinal Fundus Images/
 dataset2_balanced/
 dataset2_balanced(old dataset, don't use)/
@@ -31,13 +32,22 @@ dataset2_balanced(old dataset, don't use)/
 
 # ==============================================================================
 # Generated Large Outputs & Historical Training Archives
-# (Keep outputs/model_comparison_report.md and outputs/training_history.json)
+# (Keep outputs/model_comparison_report.md, outputs/training_history.json,
+#  and outputs/robustness/*.csv tracked in Git)
 # ==============================================================================
 outputs/*.csv
 outputs/*.png
+outputs/*5class*.json
+outputs/gatekeeper_*.json
+outputs/robustness/*.png
+!outputs/robustness/*.csv
 outputs/baseline_old_dataset/
 outputs/mobilenetv2_new_dataset/
 outputs/resnet50_new_dataset/
+outputs/mobilenetv2_dataset2_updated/
+outputs/resnet50_dataset2_updated/
+outputs/mobilenetv2_5class/
+outputs/resnet50_5class/
 
 # ==============================================================================
 # Environment, IDE, & OS Artifacts

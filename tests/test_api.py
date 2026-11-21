@@ -75,7 +75,10 @@ def run_api_tests() -> None:
 
         # 3. Predict Endpoint across 4 classes
         samples = get_one_test_image_per_class()
-        print("\n--- Testing POST /api/v1/predict (1 Sample per Class, Threshold=80%) ---")
+        print(
+            f"\n--- Testing POST /api/v1/predict "
+            f"(1 Sample per Class, Threshold={int(CONFIDENCE_THRESHOLD * 100)}%) ---"
+        )
         header = (
             f"{'True Class':<22} | {'Filename':<18} | {'Predicted':<22} | "
             f"{'Conf':>7} | {'Status':<10} | {'BlurVar':>8} | {'Time(ms)':>8}"
@@ -98,8 +101,8 @@ def run_api_tests() -> None:
             assert data["status"] == "success"
             assert data["predicted_class"] in CLASSES
             assert 0.0 <= data["confidence"] <= 1.0
-            assert data["confidence_threshold"] == 0.80
-            assert data["is_confident"] == (data["confidence"] >= 0.80)
+            assert data["confidence_threshold"] == CONFIDENCE_THRESHOLD
+            assert data["is_confident"] == (data["confidence"] >= CONFIDENCE_THRESHOLD)
             assert data["diagnosis_status"] == ("confident" if data["is_confident"] else "uncertain")
 
             probs = data["probabilities"]

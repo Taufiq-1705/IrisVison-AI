@@ -1,0 +1,68 @@
+{
+  "project": "Iris Vision",
+  "backbone": "resnet50",
+  "weights_init": "IMAGENET1K_V2",
+  "num_classes": 5,
+  "classes": [
+    "cataract",
+    "diabetic_retinopathy",
+    "glaucoma",
+    "non_fundus",
+    "normal"
+  ],
+  "class_to_idx": {
+    "cataract": 0,
+    "diabetic_retinopathy": 1,
+    "glaucoma": 2,
+    "non_fundus": 3,
+    "normal": 4
+  },
+  "idx_to_class": {
+    "0": "cataract",
+    "1": "diabetic_retinopathy",
+    "2": "glaucoma",
+    "3": "non_fundus",
+    "4": "normal"
+  },
+  "image_size": [
+    224,
+    224
+  ],
+  "preprocessing": {
+    "safe_crop_fundus_roi": true,
+    "clahe_lab": true,
+    "clahe_clip_limit": 2.0,
+    "clahe_tile_grid_size": [
+      8,
+      8
+    ],
+    "imagenet_mean": [
+      0.485,
+      0.456,
+      0.406
+    ],
+    "imagenet_std": [
+      0.229,
+      0.224,
+      0.225
+    ]
+  },
+  "training_summary": {
+    "best_epoch": 14,
+    "best_phase": "phase2_finetune",
+    "best_val_f1_macro": 0.9528,
+    "best_val_accuracy": 0.9443,
+    "best_val_loss": 0.3917,
+    "warmup_epochs": 4,
+    "finetune_epochs": 16,
+    "label_smoothing": 0.05,
+    "class_weights": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+    ],
+    "clean_conflicting_duplicates": true
+  }
+}

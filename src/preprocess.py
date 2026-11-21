@@ -1,10 +1,10 @@
 """Image preprocessing utilities for Iris Vision.
 
 Provides:
-1. Border brightness computation to distinguish circular fundus images from
-   full-frame external eye images (cataract).
-2. `safe_crop_fundus_roi()` to remove black margins around fundus images while
-   preserving cataract images 100% intact.
+1. Border brightness computation to detect circular fundus images with dark margins
+   uniformly across all ocular classes (100% fundus dataset).
+2. `safe_crop_fundus_roi()` to remove black margins around fundus images using
+   automatic border brightness thresholding (identical during training & inference).
 3. Resize to target resolution (224x224) and local contrast enhancement via
    CLAHE in LAB color space.
 """
@@ -60,15 +60,15 @@ def safe_crop_fundus_roi(
     min_roi_area_ratio: float = MIN_ROI_AREA_RATIO,
     padding: int = 2,
 ) -> np.ndarray:
-    """Crop dark margins of fundus images while keeping cataract images 100% intact.
+    """Crop dark margins of fundus images uniformly across training and inference.
 
-    Guards against accidental cropping of cataract / external photos via two layers:
-    1. Explicit class guard: if `class_name == 'cataract'`, returns the original
-       image untouched.
-    2. Visual border brightness guard: if the outer border luminance exceeds
-       `border_brightness_threshold`, returns the original image untouched
-       (vital during inference when `class_name` is unknown).
+    All 4 ocular disease classes (including `cataract`) use retinal fundus imagery.
+    Therefore `class_name` is kept only for backwards compatibility and ignored so
+    training (`dataset.py`) and API inference (`app/main.py`) execute the exact same
+    border-brightness check (`border_brightness > border_brightness_threshold`).
     """
+    _ = class_name  # Ignored intentionally to prevent training-vs-inference skew
+
     if img is None or img.size == 0:
         raise ValueError("Input image is empty or None.")
 
@@ -78,11 +78,7 @@ def safe_crop_fundus_roi(
     elif img.shape[2] == 4:
         img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
 
-    # Layer 1: Explicit cataract preservation
-    if class_name is not None and class_name.strip().lower() == "cataract":
-        return img.copy()
-
-    # Layer 2: Automatic border brightness detection (inference-safe)
+    # Automatic border brightness check (uniform for training, evaluation, and inference)
     border_brightness = compute_border_brightness(img, border_ratio=border_ratio)
     if border_brightness > border_brightness_threshold:
         return img.copy()
@@ -142,7 +138,7 @@ def preprocess_image(
     return_rgb: bool = True,
 ) -> np.ndarray:
     """Full preprocessing pipeline:
-    1. safe_crop_fundus_roi() - trims black fundus margins, keeps cataract intact.
+    1. safe_crop_fundus_roi() - trims black fundus margins uniformly via border brightness.
     2. Resize to target_size (default 224x224).
     3. LAB-space CLAHE local contrast enhancement.
     4. Optionally convert BGR -> RGB.

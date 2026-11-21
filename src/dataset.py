@@ -22,17 +22,23 @@ from src.config import (
     AUDIT_REPORT_CSV,
     BATCH_SIZE,
     CLASS_TO_IDX,
+    CLASS_TO_IDX_5,
     CLASSES,
+    CLASSES_5,
     CLEAN_MANIFEST_CSV,
     DATASET_DIR,
     FOLDER_TO_CLASS,
+    GATEKEEPER_CLASS_TO_IDX,
     IGNORED_FOLDERS,
     IMAGE_SIZE,
     IMAGENET_MEAN,
     IMAGENET_STD,
     MAX_TRAIN_SAMPLES_PER_CLASS,
     NUM_CLASSES,
+    NUM_CLASSES_5,
     NUM_WORKERS,
+    OOD_CLASS_NAME,
+    OOD_MANIFEST_CSV,
     PIN_MEMORY,
     SEED,
     SPLITS,
@@ -309,28 +315,47 @@ def _extract_base_filename(filename: str) -> str:
     return name
 
 
+def _extract_patient_or_group_id(class_name: str, filename: str) -> str:
+    """Build canonical group key so left/right eyes of same patient and aug_ copies stay together."""
+    base = _extract_base_filename(filename)
+    m = re.search(r"(\d+)_(?:left|right)", base, flags=re.IGNORECASE)
+    if m:
+        return f"{class_name}__pid_{m.group(1)}"
+    return f"{class_name}__base_{base.lower()}"
+
+
 def clean_conflicting_duplicates_df(
     df: pd.DataFrame,
     audit_csv_path: Path = AUDIT_REPORT_CSV,
     save_manifest_path: Optional[Path] = CLEAN_MANIFEST_CSV,
+    near_dup_mae_threshold: float = 3.0,
+    seed: int = SEED,
 ) -> pd.DataFrame:
-    """O(N) scalable duplicate & split-leakage cleaning for large ocular datasets.
+    """Comprehensive duplicate, conflict, noise, & patient-leakage cleaning pipeline.
 
-    1. Base-Name Split Leakage Pruning:
-       - Removes any `train` row (original or `aug_*`) whose `(class_name, base_name)`
-         appears in `val` or `test`, keeping `val` and `test` 100% intact.
-    2. Parallel MD5 Checksum Deduplication:
-       - Computes MD5 in parallel (`ThreadPoolExecutor`) for non-augmented files
-         (and all files when `len <= 15000`).
-       - Drops all occurrences of any MD5 shared across >1 distinct class label
-         plus any `aug_*` copies derived from their base names.
-       - Deduplicates identical-label MD5 copies prioritizing `test` > `val` > `train`.
+    1. Removes synthetic `aug_noise_*` artifacts and redundant `Copy of ...` files.
+    2. Prunes train-to-val/test base-name overlaps.
+    3. Removes exact MD5 label conflicts (>1 class) + derived `aug_*` copies, and
+       deduplicates identical-label MD5 copies.
+    4. For datasets <= 10,000 images, runs a 16x16 thumbnail GPU/CPU scan verified at
+       full resolution (`MAE < 3.0`) to eliminate near-duplicate label conflicts and
+       cross-split near-duplicate leaks.
+    5. If the dataset lacks a `test` split (or has cross-split patient leakage),
+       performs a deterministic Patient-Grouped Stratified Split (70% train / 15% val /
+       15% test) where `val` and `test` contain only original (`~is_augmented`),
+       `>= 224x224` images with zero patient or base-image overlap with `train`.
     """
     work_df = df.copy().reset_index(drop=True)
     initial_count = len(work_df)
     work_df["base_name"] = work_df["filename"].apply(_extract_base_filename)
 
-    # Step 1: Prune train rows (and aug_ derivatives) leaking into val/test by base_name
+    # Step 0: Remove extreme aug_noise_* and 'Copy of ' files
+    fname_lower = work_df["filename"].str.lower()
+    noise_or_copy_mask = fname_lower.str.startswith("aug_noise") | fname_lower.str.startswith("copy of ")
+    noise_copy_removed = int(noise_or_copy_mask.sum())
+    work_df = work_df[~noise_or_copy_mask].reset_index(drop=True)
+
+    # Step 1: Prune train rows leaking into existing val/test by base_name
     eval_mask = work_df["orig_split"].isin(["val", "test"])
     eval_keys = set(
         zip(
@@ -348,13 +373,18 @@ def clean_conflicting_duplicates_df(
     # Step 2: Compute MD5 hashes (reusing audit CSV if available, else parallel hashing)
     if "md5_hash" not in work_df.columns:
         if audit_csv_path.exists():
-            audit_df = pd.read_csv(audit_csv_path, usecols=["filepath", "md5_hash"])
-            hash_map = dict(zip(audit_df["filepath"], audit_df["md5_hash"]))
-            work_df["md5_hash"] = work_df["filepath"].map(hash_map)
-        else:
+            audit_df = pd.read_csv(audit_csv_path)
+            if {"filepath", "md5_hash"}.issubset(audit_df.columns):
+                hash_map = dict(zip(audit_df["filepath"], audit_df["md5_hash"]))
+                work_df["md5_hash"] = work_df["filepath"].map(hash_map)
+            if {"filepath", "width", "height"}.issubset(audit_df.columns):
+                w_map = dict(zip(audit_df["filepath"], audit_df["width"]))
+                h_map = dict(zip(audit_df["filepath"], audit_df["height"]))
+                work_df["width"] = work_df["filepath"].map(w_map)
+                work_df["height"] = work_df["filepath"].map(h_map)
+        if "md5_hash" not in work_df.columns:
             work_df["md5_hash"] = pd.Series(dtype="object")
 
-        # Hash non-augmented files (or all files when dataset <= 15k) in parallel
         if len(work_df) > 15000:
             to_hash_mask = work_df["md5_hash"].isna() & (~work_df["is_augmented"])
             aug_missing_mask = work_df["md5_hash"].isna() & work_df["is_augmented"]
@@ -386,22 +416,138 @@ def clean_conflicting_duplicates_df(
     )
     cleaned_df = work_df[~work_df["md5_hash"].isin(conflicting_hashes)].copy()
 
-    # Remove any aug_ images derived from conflicting base names
-    aug_conflict_mask = cleaned_df["is_augmented"] & cleaned_df["base_name"].isin(conflicting_base_names)
-    aug_conflict_removed = int(aug_conflict_mask.sum())
-    cleaned_df = cleaned_df[~aug_conflict_mask].copy()
-
     # Deduplicate same-label exact MD5 copies keeping test/val priority
     before_dedup = len(cleaned_df)
     cleaned_df = cleaned_df.drop_duplicates(subset=["md5_hash"], keep="first").reset_index(drop=True)
     md5_same_removed = before_dedup - len(cleaned_df)
+
+    # Step 3: Near-duplicate pixel check (MAE < 3.0) when dataset <= 10,000 images
+    near_conflict_removed = 0
+    near_dup_removed = 0
+    if len(cleaned_df) <= 10000:
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            thumbs = list(
+                ex.map(
+                    lambda p: cv2.resize(cv2.imread(p, cv2.IMREAD_GRAYSCALE), (16, 16)).flatten(),
+                    cleaned_df["filepath"].tolist(),
+                )
+            )
+        thumbs_np = np.stack(thumbs).astype(np.float32)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        t_thumbs = torch.from_numpy(thumbs_np).to(device)
+        dist_mat = torch.cdist(t_thumbs, t_thumbs, p=1) / 256.0
+        idx_i, idx_j = torch.where(torch.triu(dist_mat < 4.0, diagonal=1))
+        cand_pairs = list(zip(idx_i.cpu().tolist(), idx_j.cpu().tolist()))
+
+        img_cache: dict[int, np.ndarray] = {}
+
+        def _get_bgr(idx: int) -> np.ndarray:
+            if idx not in img_cache:
+                img_cache[idx] = cv2.imread(cleaned_df.iloc[idx]["filepath"], cv2.IMREAD_COLOR).astype(np.float32)
+            return img_cache[idx]
+
+        near_conflict_idx: set[int] = set()
+        near_same_drop_idx: set[int] = set()
+        for i, j in cand_pairs:
+            ri, rj = cleaned_df.iloc[i], cleaned_df.iloc[j]
+            im_i, im_j = _get_bgr(i), _get_bgr(j)
+            if im_i.shape != im_j.shape:
+                im_j = cv2.resize(im_j, (im_i.shape[1], im_i.shape[0]))
+            mae = float(np.abs(im_i - im_j).mean())
+            if mae < near_dup_mae_threshold:
+                if ri["class_name"] != rj["class_name"]:
+                    near_conflict_idx.add(i)
+                    near_conflict_idx.add(j)
+                else:
+                    # Since cleaned_df is sorted by _split_prio (test > val > train), drop j
+                    near_same_drop_idx.add(j)
+
+        conflicting_base_names |= set(cleaned_df.loc[list(near_conflict_idx), "base_name"])
+        near_conflict_removed = len(near_conflict_idx)
+        near_dup_removed = len(near_same_drop_idx - near_conflict_idx)
+        cleaned_df = cleaned_df.drop(index=list(near_conflict_idx | near_same_drop_idx)).reset_index(drop=True)
+
+    # Remove any aug_ images derived from conflicting base names
+    aug_conflict_mask = cleaned_df["is_augmented"] & cleaned_df["base_name"].isin(conflicting_base_names)
+    aug_conflict_removed = int(aug_conflict_mask.sum())
+    cleaned_df = cleaned_df[~aug_conflict_mask].reset_index(drop=True)
     cleaned_df = cleaned_df.drop(columns=["_split_prio"], errors="ignore")
+
+    # Step 4: Patient-Grouped Stratified Split (70/15/15) if 'test' split is missing
+    existing_splits = set(cleaned_df["orig_split"].unique())
+    if "test" not in existing_splits:
+        cleaned_df["group_id"] = [
+            _extract_patient_or_group_id(c, f)
+            for c, f in zip(cleaned_df["class_name"], cleaned_df["filename"])
+        ]
+        if "width" not in cleaned_df.columns or cleaned_df["width"].isna().any():
+            def _read_wh(p: str) -> Tuple[int, int]:
+                im = cv2.imread(p)
+                return (im.shape[1], im.shape[0]) if im is not None else (0, 0)
+
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                wh_list = list(ex.map(_read_wh, cleaned_df["filepath"].tolist()))
+            cleaned_df["width"] = [w for w, _ in wh_list]
+            cleaned_df["height"] = [h for _, h in wh_list]
+
+        train_parts: list[pd.DataFrame] = []
+        val_parts: list[pd.DataFrame] = []
+        test_parts: list[pd.DataFrame] = []
+
+        for cls_name, cls_df in cleaned_df.groupby("class_name", sort=True):
+            # Only original, >=224x224 groups are eligible for val/test
+            orig_cls = cls_df[~cls_df["is_augmented"]]
+            group_min_wh = orig_cls.groupby("group_id")[["width", "height"]].min()
+            eval_eligible_groups = sorted(
+                group_min_wh[
+                    (group_min_wh["width"] >= 224) & (group_min_wh["height"] >= 224)
+                ].index.tolist()
+            )
+            train_only_groups = set(cls_df["group_id"].unique()) - set(eval_eligible_groups)
+
+            rng = np.random.RandomState(seed)
+            shuffled_groups = list(eval_eligible_groups)
+            rng.shuffle(shuffled_groups)
+
+            n_total_groups = len(cls_df["group_id"].unique())
+            n_val = max(1, int(round(n_total_groups * VAL_RATIO)))
+            n_test = max(1, int(round(n_total_groups * TEST_RATIO)))
+
+            val_groups = set(shuffled_groups[:n_val])
+            test_groups = set(shuffled_groups[n_val : n_val + n_test])
+            train_groups = set(shuffled_groups[n_val + n_test :]) | train_only_groups
+
+            # Val & Test keep ONLY original (~is_augmented) images; Train keeps originals + aug_
+            tr_part = cls_df[cls_df["group_id"].isin(train_groups)].copy()
+            va_part = cls_df[cls_df["group_id"].isin(val_groups) & (~cls_df["is_augmented"])].copy()
+            te_part = cls_df[cls_df["group_id"].isin(test_groups) & (~cls_df["is_augmented"])].copy()
+
+            tr_part["orig_split"] = "train"
+            va_part["orig_split"] = "val"
+            te_part["orig_split"] = "test"
+
+            train_parts.append(tr_part)
+            val_parts.append(va_part)
+            test_parts.append(te_part)
+
+        cleaned_df = pd.concat(train_parts + val_parts + test_parts, ignore_index=True)
+        cleaned_df["split"] = cleaned_df["orig_split"]
+        print(
+            f"[PATIENT-GROUP SPLIT] Rebuilt leak-free 70/15/15 splits -> "
+            f"Train: {int((cleaned_df['orig_split']=='train').sum())} | "
+            f"Val: {int((cleaned_df['orig_split']=='val').sum())} | "
+            f"Test: {int((cleaned_df['orig_split']=='test').sum())}"
+        )
 
     print(
         f"[MANIFEST CLEAN] Initial: {initial_count} | "
-        f"Train-to-Val/Test base leaks removed: {base_leak_removed} | "
-        f"MD5 conflicts: {md5_conflict_removed} | Aug-derived conflicts: {aug_conflict_removed} | "
-        f"MD5 same-label dedup: {md5_same_removed} | Clean total: {len(cleaned_df)}"
+        f"Noise/Copy removed: {noise_copy_removed} | "
+        f"Base leaks removed: {base_leak_removed} | "
+        f"MD5 conflicts: {md5_conflict_removed} | "
+        f"Near-dup conflicts: {near_conflict_removed} | "
+        f"Near-dup/MD5 same-label dedup: {md5_same_removed + near_dup_removed} | "
+        f"Aug-derived conflicts: {aug_conflict_removed} | "
+        f"Clean total: {len(cleaned_df)}"
     )
 
     if save_manifest_path is not None:
@@ -444,17 +590,140 @@ def sample_balanced_train_df(
     return balanced_df.sample(frac=1.0, random_state=seed).reset_index(drop=True)
 
 
-def compute_class_weights(df: pd.DataFrame) -> torch.Tensor:
-    """Compute balanced inverse-frequency weights ordered by CLASSES index."""
+def compute_class_weights(df: pd.DataFrame, num_classes: int = NUM_CLASSES) -> torch.Tensor:
+    """Compute balanced inverse-frequency weights ordered by class index."""
     counts = df["label_idx"].value_counts().to_dict()
     total = float(len(df))
     weights = []
-    for idx in range(NUM_CLASSES):
+    for idx in range(num_classes):
         cnt = float(counts.get(idx, 1))
-        weights.append(total / (NUM_CLASSES * cnt))
+        weights.append(total / (num_classes * cnt))
     weight_tensor = torch.tensor(weights, dtype=torch.float32)
     # Normalize mean to 1.0 for loss magnitude stability
     return weight_tensor / weight_tensor.mean()
+
+
+def scan_non_fundus_splits(dataset_dir: Path = DATASET_DIR) -> pd.DataFrame:
+    """Scan `{dataset_dir}/{split}/non_fundus` folders into a DataFrame for OOD training/evaluation."""
+    if OOD_MANIFEST_CSV.exists():
+        ood_df = pd.read_csv(OOD_MANIFEST_CSV)
+        expected_prefix = str(dataset_dir.resolve())
+        if (
+            not ood_df.empty
+            and {"filepath", "orig_split", "class_name"}.issubset(ood_df.columns)
+            and str(ood_df.iloc[0]["filepath"]).startswith(expected_prefix)
+            and Path(ood_df.iloc[0]["filepath"]).exists()
+        ):
+            return ood_df.copy()
+
+    records: list[dict] = []
+    for split in SPLITS:
+        ood_dir = dataset_dir / split / OOD_CLASS_NAME
+        if not ood_dir.exists():
+            continue
+        for file_path in sorted(ood_dir.iterdir()):
+            if file_path.is_file() and file_path.suffix.lower() in VALID_EXTENSIONS:
+                records.append(
+                    {
+                        "filepath": str(file_path.resolve()),
+                        "filename": file_path.name,
+                        "class_name": OOD_CLASS_NAME,
+                        "label_idx": CLASS_TO_IDX_5[OOD_CLASS_NAME],
+                        "orig_split": split,
+                        "split": split,
+                        "is_augmented": False,
+                    }
+                )
+    if not records:
+        raise FileNotFoundError(
+            f"No `{OOD_CLASS_NAME}` images found under {dataset_dir}/{{train,val,test}}/{OOD_CLASS_NAME}. "
+            "Run `python src/prepare_ood_data.py` first."
+        )
+    return pd.DataFrame(records)
+
+
+def get_5class_split_dataframes(
+    dataset_dir: Path = DATASET_DIR,
+    balance_train: bool = True,
+    balance_strategy: str = "oversample",
+    max_train_per_class: int = MAX_TRAIN_SAMPLES_PER_CLASS,
+    seed: int = SEED,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Return leak-free 5-class (`cataract`, `diabetic_retinopathy`, `glaucoma`, `non_fundus`, `normal`) splits."""
+    # 1. Load cleaned 4-class ocular splits without oversampling yet
+    tr_eye, va_eye, te_eye = get_split_dataframes(
+        dataset_dir=dataset_dir,
+        use_existing_splits=True,
+        clean_conflicting_duplicates=True,
+        balance_train=False,
+        max_train_per_class=0,
+        seed=seed,
+    )
+    # Caution: get_split_dataframes auto-balances if imbalance ratio > 1.5; reload raw from CLEAN_MANIFEST_CSV if available
+    if CLEAN_MANIFEST_CSV.exists():
+        clean_eye_df = pd.read_csv(CLEAN_MANIFEST_CSV)
+        expected_prefix = str(dataset_dir.resolve())
+        if not clean_eye_df.empty and str(clean_eye_df.iloc[0]["filepath"]).startswith(expected_prefix):
+            tr_eye = clean_eye_df[clean_eye_df["orig_split"] == "train"].copy()
+            va_eye = clean_eye_df[clean_eye_df["orig_split"] == "val"].copy()
+            te_eye = clean_eye_df[clean_eye_df["orig_split"] == "test"].copy()
+
+    ood_df = scan_non_fundus_splits(dataset_dir=dataset_dir)
+    tr_ood = ood_df[ood_df["orig_split"] == "train"].copy()
+    va_ood = ood_df[ood_df["orig_split"] == "val"].copy()
+    te_ood = ood_df[ood_df["orig_split"] == "test"].copy()
+
+    common_cols = ["filepath", "filename", "class_name", "orig_split", "is_augmented"]
+    train_df = pd.concat([tr_eye[common_cols], tr_ood[common_cols]], ignore_index=True)
+    val_df = pd.concat([va_eye[common_cols], va_ood[common_cols]], ignore_index=True)
+    test_df = pd.concat([te_eye[common_cols], te_ood[common_cols]], ignore_index=True)
+
+    for split_name, part_df in [("train", train_df), ("val", val_df), ("test", test_df)]:
+        part_df["split"] = split_name
+        part_df["label_idx"] = part_df["class_name"].map(CLASS_TO_IDX_5).astype(int)
+
+    if max_train_per_class > 0:
+        train_df = sample_balanced_train_df(train_df, max_per_class=max_train_per_class, seed=seed)
+    if balance_train:
+        train_df = balance_classes_df(train_df, strategy=balance_strategy, seed=seed)
+        train_df["label_idx"] = train_df["class_name"].map(CLASS_TO_IDX_5).astype(int)
+
+    val_df = val_df.sample(frac=1.0, random_state=seed).reset_index(drop=True)
+    test_df = test_df.sample(frac=1.0, random_state=seed).reset_index(drop=True)
+    return train_df, val_df, test_df
+
+
+def get_gatekeeper_split_dataframes(
+    dataset_dir: Path = DATASET_DIR,
+    balance_train: bool = False,
+    seed: int = SEED,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Return binary Gatekeeper splits (`0: non_eye`, `1: valid_eye`) with zero data leakage."""
+    train_5, val_5, test_5 = get_5class_split_dataframes(
+        dataset_dir=dataset_dir,
+        balance_train=False,
+        max_train_per_class=0,
+        seed=seed,
+    )
+
+    def _to_binary(df_in: pd.DataFrame) -> pd.DataFrame:
+        out = df_in.copy()
+        is_ood = out["class_name"] == OOD_CLASS_NAME
+        out["source_class"] = out["class_name"]
+        out["class_name"] = np.where(is_ood, "non_eye", "valid_eye")
+        out["label_idx"] = out["class_name"].map(GATEKEEPER_CLASS_TO_IDX).astype(int)
+        return out.reset_index(drop=True)
+
+    train_bin = _to_binary(train_5)
+    val_bin = _to_binary(val_5)
+    test_bin = _to_binary(test_5)
+
+    if balance_train:
+        train_bin = balance_classes_df(train_bin, strategy="oversample", seed=seed)
+    else:
+        train_bin = train_bin.sample(frac=1.0, random_state=seed).reset_index(drop=True)
+
+    return train_bin, val_bin, test_bin
 
 
 def get_split_dataframes(
@@ -495,7 +764,8 @@ def get_split_dataframes(
             train_df = sample_balanced_train_df(
                 train_df, max_per_class=max_train_per_class, seed=seed
             )
-        if balance_train:
+        cls_counts = train_df["class_name"].value_counts()
+        if balance_train or (not cls_counts.empty and (cls_counts.max() / max(1, cls_counts.min())) > 1.5):
             train_df = balance_classes_df(train_df, strategy=balance_strategy, seed=seed)
     else:
         train_df, val_df, test_df = create_stratified_splits(

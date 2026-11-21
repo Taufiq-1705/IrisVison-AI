@@ -1,0 +1,29 @@
+{
+  "project": "Iris Vision - Layer 1 Gatekeeper",
+  "backbone": "mobilenet_v2",
+  "num_classes": 2,
+  "classes": [
+    "non_eye",
+    "valid_eye"
+  ],
+  "class_to_idx": {
+    "non_eye": 0,
+    "valid_eye": 1
+  },
+  "idx_to_class": {
+    "0": "non_eye",
+    "1": "valid_eye"
+  },
+  "image_size": [
+    224,
+    224
+  ],
+  "eye_threshold": 0.65,
+  "validation_summary": {
+    "best_epoch": 10,
+    "val_accuracy": 1.0,
+    "val_macro_f1": 1.0,
+    "val_recall_valid_eye": 1.0,
+    "val_recall_non_eye": 1.0
+  }
+}

@@ -13,9 +13,11 @@ Saves:
 - EDA plots + outlier sample thumbnails -> outputs/eda_summary.png
 """
 
+import argparse
 import hashlib
 import os
 from pathlib import Path
+import re
 import sys
 import warnings
 
@@ -26,6 +28,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+import torch
 from tqdm import tqdm
 
 # Allow running directly as `python src/audit_dataset.py` from project root
@@ -39,8 +42,11 @@ from src.config import (
     CLASSES,
     DATASET_DIR,
     EDA_SUMMARY_PNG,
+    FOLDER_TO_CLASS,
     FUNDUS_BORDER_BRIGHTNESS_THRESHOLD,
     FUNDUS_BORDER_RATIO,
+    IGNORED_FOLDERS,
+    OLD_DATASET_DIR,
     SPLITS,
     VALID_EXTENSIONS,
     ensure_output_dir,
@@ -143,11 +149,14 @@ def run_dataset_audit(dataset_dir: Path = DATASET_DIR) -> pd.DataFrame:
         split_dir = dataset_dir / split
         if not split_dir.exists():
             continue
-        for class_name in CLASSES:
-            class_dir = split_dir / class_name
-            if not class_dir.exists():
+        for sub_dir in sorted(split_dir.iterdir()):
+            if not sub_dir.is_dir():
                 continue
-            for p in sorted(class_dir.iterdir()):
+            folder_key = sub_dir.name.lower().strip()
+            if folder_key in IGNORED_FOLDERS or folder_key not in FOLDER_TO_CLASS:
+                continue
+            class_name = FOLDER_TO_CLASS[folder_key]
+            for p in sorted(sub_dir.iterdir()):
                 if p.is_file() and p.suffix.lower() in VALID_EXTENSIONS:
                     file_tasks.append((p, split, class_name))
 
@@ -161,7 +170,7 @@ def run_dataset_audit(dataset_dir: Path = DATASET_DIR) -> pd.DataFrame:
     if df.empty:
         raise RuntimeError("No valid image files discovered during audit.")
 
-    # Duplicate & Cross-Split Duplicate Detection
+    # Duplicate & Cross-Split Duplicate Detection (MD5)
     hash_counts = df["md5_hash"].value_counts()
     df["duplicate_count"] = df["md5_hash"].map(hash_counts)
     df["is_duplicate"] = df["duplicate_count"] > 1
@@ -170,7 +179,78 @@ def run_dataset_audit(dataset_dir: Path = DATASET_DIR) -> pd.DataFrame:
     df["splits_with_hash"] = df["md5_hash"].map(split_nunique_per_hash)
     df["is_cross_split_duplicate"] = df["splits_with_hash"] > 1
 
+    class_nunique_per_hash = df.groupby("md5_hash")["class_name"].nunique()
+    df["is_md5_label_conflict"] = df["md5_hash"].map(class_nunique_per_hash) > 1
+
+    # Extract Eye / Patient ID (e.g. 1102_left.jpg -> 1102)
+    def _extract_patient_id(fname: str) -> str:
+        m = re.search(r"(\d+)_(?:left|right)", fname, flags=re.IGNORECASE)
+        return m.group(1) if m else ""
+
+    df["patient_id"] = df["filename"].apply(_extract_patient_id)
     return df
+
+
+def scan_near_duplicates_and_patient_overlap(valid_df: pd.DataFrame) -> None:
+    """Scan for pixel-level near-duplicates (MAE < 3.0) and patient eye-pair leakage."""
+    print("\n--- 3b. Near-Duplicate Pixel Scan (MAE < 3.0) & Patient Overlap ---")
+    if len(valid_df) <= 10000:
+        thumbs = np.stack(
+            [cv2.resize(cv2.imread(p, cv2.IMREAD_GRAYSCALE), (16, 16)).flatten() for p in valid_df["filepath"]]
+        ).astype(np.float32)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        t_thumbs = torch.from_numpy(thumbs).to(device)
+        dist = torch.cdist(t_thumbs, t_thumbs, p=1) / 256.0
+        idx_i, idx_j = torch.where(torch.triu(dist < 4.0, diagonal=1))
+        cand_pairs = list(zip(idx_i.cpu().tolist(), idx_j.cpu().tolist()))
+
+        img_cache: dict[int, np.ndarray] = {}
+        near_conflicts = []
+        near_cross_leaks = []
+        for i, j in cand_pairs:
+            ri, rj = valid_df.iloc[i], valid_df.iloc[j]
+            if ri["md5_hash"] == rj["md5_hash"]:
+                continue
+            cls_diff = ri["class_name"] != rj["class_name"]
+            split_diff = ri["split"] != rj["split"]
+            if cls_diff or split_diff:
+                if i not in img_cache:
+                    img_cache[i] = cv2.imread(ri["filepath"]).astype(np.float32)
+                if j not in img_cache:
+                    img_cache[j] = cv2.imread(rj["filepath"]).astype(np.float32)
+                im_i, im_j = img_cache[i], img_cache[j]
+                if im_i.shape != im_j.shape:
+                    im_j = cv2.resize(im_j, (im_i.shape[1], im_i.shape[0]))
+                mae = float(np.abs(im_i - im_j).mean())
+                if mae < 3.0:
+                    entry = (
+                        f"{ri['split']}/{ri['class_name']}/{ri['filename']}",
+                        f"{rj['split']}/{rj['class_name']}/{rj['filename']}",
+                        round(mae, 2),
+                    )
+                    if cls_diff:
+                        near_conflicts.append(entry)
+                    elif split_diff:
+                        near_cross_leaks.append(entry)
+
+        print(f"Near-dup pixel conflicts (MAE < 3.0, diff class)  : {len(near_conflicts)}")
+        for a, b, m in near_conflicts[:5]:
+            print(f"  CONFLICT: {a} == {b} (MAE={m})")
+        print(f"Near-dup cross-split leaks (MAE < 3.0, same class): {len(near_cross_leaks)}")
+        for a, b, m in near_cross_leaks[:5]:
+            print(f"  LEAK    : {a} == {b} (MAE={m})")
+
+    # Patient ID overlap across splits (left/right eye of same patient)
+    pid_df = valid_df[valid_df["patient_id"] != ""]
+    if not pid_df.empty:
+        pid_splits = pid_df.groupby("patient_id")["split"].nunique()
+        cross_pids = pid_splits[pid_splits > 1].index.tolist()
+        print(f"Patient IDs (left/right eye) shared across splits : {len(cross_pids)}")
+        if cross_pids:
+            sample_pids = pid_df[pid_df["patient_id"].isin(cross_pids[:5])]
+            for pid, grp in sample_pids.groupby("patient_id"):
+                locs = [f"{r['split']}/{r['class_name']}/{r['filename']}" for _, r in grp.iterrows()]
+                print(f"  Patient {pid} -> {locs}")
 
 
 def print_audit_summary(df: pd.DataFrame) -> None:
@@ -215,8 +295,11 @@ def print_audit_summary(df: pd.DataFrame) -> None:
     dup_hashes = valid_df[valid_df["is_duplicate"]]["md5_hash"].nunique()
     cross_split_rows = valid_df[valid_df["is_cross_split_duplicate"]]
     cross_hashes = cross_split_rows["md5_hash"].nunique()
+    conflict_rows = valid_df[valid_df["is_md5_label_conflict"]]
+    conflict_hashes = conflict_rows["md5_hash"].nunique()
     print(f"Total duplicate file clusters (same MD5)  : {dup_hashes}")
     print(f"Total images involved in any duplicate    : {int(valid_df['is_duplicate'].sum())}")
+    print(f"MD5 clusters with CONFLICTING labels      : {conflict_hashes} ({len(conflict_rows)} images)")
     print(f"Cross-split duplicate MD5 clusters        : {cross_hashes}")
     print(f"Total images involved in cross-split leak : {len(cross_split_rows)}")
     if cross_hashes > 0:
@@ -224,6 +307,13 @@ def print_audit_summary(df: pd.DataFrame) -> None:
         for h, grp in list(cross_split_rows.groupby("md5_hash"))[:5]:
             locs = [f"{r['split']}/{r['class_name']}/{r['filename']}" for _, r in grp.iterrows()]
             print(f"  MD5 {h[:10]} -> {locs}")
+    if conflict_hashes > 0:
+        print("Sample MD5 label-conflict clusters (up to 5):")
+        for h, grp in list(conflict_rows.groupby("md5_hash"))[:5]:
+            locs = [f"{r['split']}/{r['class_name']}/{r['filename']}" for _, r in grp.iterrows()]
+            print(f"  MD5 {h[:10]} -> {locs}")
+
+    scan_near_duplicates_and_patient_overlap(valid_df)
 
     # 4. Blur Detection
     print(f"\n--- 4. Blur Detection (Laplacian Variance < {BLUR_LAPLACIAN_THRESHOLD}) ---")
@@ -447,8 +537,17 @@ def generate_eda_plots(df: pd.DataFrame, output_path: Path = EDA_SUMMARY_PNG) ->
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Audit ocular dataset integrity and distributions.")
+    parser.add_argument(
+        "--dataset",
+        type=Path,
+        default=OLD_DATASET_DIR,
+        help="Path to dataset directory containing train/val(/test) folders.",
+    )
+    args = parser.parse_args()
+
     ensure_output_dir()
-    audit_df = run_dataset_audit(DATASET_DIR)
+    audit_df = run_dataset_audit(args.dataset)
     audit_df.to_csv(AUDIT_REPORT_CSV, index=False)
     print(f"[SAVED] Audit report CSV saved to: {AUDIT_REPORT_CSV}")
 
